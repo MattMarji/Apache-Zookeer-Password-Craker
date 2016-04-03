@@ -104,6 +104,7 @@ public class ZkConnector implements Watcher {
                         @Override
                         public void process(WatchedEvent event) {
                             // check for event type NodeCreated
+
                             boolean isNodeCreated = event.getType().equals(EventType.NodeCreated);
 
                             boolean isNodeModified = event.getType().equals(

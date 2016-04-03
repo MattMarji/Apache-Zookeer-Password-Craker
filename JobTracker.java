@@ -19,12 +19,12 @@ import java.util.concurrent.Semaphore;
 import java.util.concurrent.locks.Lock;
 import java.util.concurrent.locks.ReentrantLock;
 
-public class JobTracker extends Thread implements Watcher {
+public class JobTracker extends Thread {
 
 
     static String ZK_REQUESTS = "/requests";
     static String ZK_JOBS = "/jobs";
-    static String ZK_FS = "/fs"
+    static String ZK_FS = "/fs";
     static String ZK_WORKERS = "/workers";
 
     static final int NUM_WORDS = 265744;
@@ -38,16 +38,13 @@ public class JobTracker extends Thread implements Watcher {
 
     // JobTracker
     static String jobTrackerPath;
-    static String JT_TRACKER = "/jt";
-    static String JT_PRIMARY = "P";
-    static String JT_BACKUP = "B";
+    static String ZK_TRACKERS = "/jt";
+    static boolean isLeader = false;
+    static CountDownLatch jobTrackerLatch = new CountDownLatch(1);
     static CountDownLatch nodeCreatedLatch = new CountDownLatch(1);
 
-    // Client Tracking
-    Semaphore clientWait = new Semaphore(1);
-    static ArrayList<String> clientList = new ArrayList<String>();
-    // Job tracking --> Client ID: hash1,hash2,hash3 etc..
-    static HashMap <String, ArrayList<String>> jobs = new HashMap<String, ArrayList<String>>();
+    // Worker resources
+    static CountDownLatch workerLatch = new CountDownLatch(1);
 
     // Constructor
     public JobTracker(String connection) {
@@ -76,45 +73,52 @@ public class JobTracker extends Thread implements Watcher {
 
         // ========================== JOBTRACKER NODE SETUP ==================
             // Determine if a tracker exists. No need for a watch.
-            stat = zk.exists(ZK_TRACKER, false);
+            stat = zk.exists(ZK_TRACKERS, false);
 
             // Does not exist!
             if (stat == null) {
                 // Create root node for trackers...
                 zk.create(
-                    ZK_TRACKER,
+                    ZK_TRACKERS,
                     null,
                     ZooDefs.Ids.OPEN_ACL_UNSAFE,
                     CreateMode.PERSISTENT);
 
                 // Since tracker did not exist, we are first. Become Primary.
-                // Path: /tracker/P
+                // Path:
                 jobTrackerPath = zk.create(
-                    ZK_TRACKER + "/" + TRACKER_PRIMARY,
+                    ZK_TRACKERS + "/",
                     null,
                     ZooDefs.Ids.OPEN_ACL_UNSAFE,
-                    CreateMode.EPHEMERAL
+                    CreateMode.EPHEMERAL_SEQUENTIAL
                     );
+
+                isLeader = true;
             }
 
             // /tracker exists --> if it has a child already assume it has a leader, else take over as leader!
 
-            //TO-DO: Handle election process...
             else {
+                // If there are no children, we must be the leader by default.
                 if (stat.getNumChildren() == 0) {
                    jobTrackerPath = zk.create(
-                    ZK_TRACKER + "/" + TRACKER_PRIMARY,
+                    ZK_TRACKERS + "/",
                     null,
                     ZooDefs.Ids.OPEN_ACL_UNSAFE,
-                    CreateMode.EPHEMERAL
+                    CreateMode.EPHEMERAL_SEQUENTIAL
                     );
+
+                   isLeader = true;
+
                } else {
                    jobTrackerPath = zk.create(
-                    ZK_TRACKER + "/" + TRACKER_BACKUP,
+                    ZK_TRACKERS + "/",
                     null,
                     ZooDefs.Ids.OPEN_ACL_UNSAFE,
-                    CreateMode.EPHEMERAL
+                    CreateMode.EPHEMERAL_SEQUENTIAL
                     );
+
+                   isLeader = false;
                }
             }
         // =============================================================
@@ -160,88 +164,42 @@ public class JobTracker extends Thread implements Watcher {
         }
     }
 
-    public class RequestListener implements Runnable {
-        @Override
-        public void run() {
-            List<String> requests;
-            Stat stat;
-            byte[] data;
-            String nodeData;
-
-            while(true) {
-
-                requests = zk.getChildren(ZK_REQUEST, new Watcher() {
-                    @Override
-                    public void process(WatchedEvent event) {
-                        if (event.getType == Event.EventType.NodeChildrenChanged) {
-                            // There has been a change in the number of jobs.
-                            childenChanged.countDown();
-                        }
-                    }
-                }
-
-                // Sit and wait for a result!!
-                try{
-                    childrenChanged.await();
-                    requests = zk.getChildren(ZK_REQUEST, false);
-                } catch(Exception e) {
-                    System.out.println(e.getMessage());
-                }
-                );
-
-                // COMPLETION OF REQUEST SHOULD OCCUR IN ANOTHER THREAD
-                // Sort the jobs in order incase they are not.
-                // FROM API DOCS: The list of children returned is not sorted and no guarantee is provided as to its natural or lexical order.
-                Collections.sort(requests);
-                System.out.println("requests: " + requests.toString());
-
-                // Last request must be a new request.
-                String request = requests.get(requests.size-1), result = null;
-                stat = new Stat();
-                data = zk.getData(request_path + request, false, stat);
-
-                // Just to be sure!!
-                if (stat != null) {
-                    nodeData = byteToString(data);
-
-                    // Determine if this is a job or status.
-                    String[] resultArr = nodeData.split(":");
-
-                    if (resultArr[2].equals("100")) {
-                    	// This is a job -- add to /jobs.
-                    	handleJob(resultArr[0]);
-                    } else if (resultArr[2].equals("101")) {
-                    	// This is a status -- get job status.
-                    	handleStatus(request_path + request, resultArr[0]);
-                    } else {
-                    	System.out.println("Unknown Task Type!");
-                    }
-                }
-
-            }
-        }
-    }
-
     // Handle a new job
     public void handleJob(String pwHash) {
         String task = String.format("%s:%s",  pwHash, "ongoing");
 
         // Set data string to bytes
-        byte[] byteData = null;
-            if(data != null) {
-                byteData = task.getBytes();
-            }
+        byte[] byteData = task.getBytes();
 
         // Create a new job...
-        String jobPath = zk.create(
+        String jobPath = null;
+
+        try {
+            jobPath = zk.create(
             ZK_JOBS + "/",
             byteData,
             ZooDefs.Ids.OPEN_ACL_UNSAFE,
             CreateMode.PERSISTENT_SEQUENTIAL);
 
+        } catch(KeeperException e) {
+            System.out.println(e.code());
+        } catch(Exception e) {
+            System.out.println(e.getMessage());
+        }
+
         // Determine the number of workers
-        Stat stat = zk.exists(ZK_WORKERS, false);
+        Stat stat = null;
+        try {
+            stat = zk.exists(ZK_WORKERS, false);
+        } catch(KeeperException e) {
+            System.out.println(e.code());
+        } catch(Exception e) {
+            System.out.println(e.getMessage());
+        }
+
         int numWorkers = stat.getNumChildren();
+
+        System.out.println("Number of workers: " + numWorkers);
 
         int partition_size = NUM_WORDS / numWorkers;
         int word_remainder = NUM_WORDS % numWorkers;
@@ -260,95 +218,426 @@ public class JobTracker extends Thread implements Watcher {
             	endIdx = ((i + 1) * partition_size) -1;
             }
 
-            String task = String.format("%s:%s:%s", "-1", Integer.toString(startIdx), Integer.toString(endIdx));
+            task = String.format("%s:%s:%s", "-1", Integer.toString(startIdx), Integer.toString(endIdx));
 
             // Set data string to bytes
-            byte[] byteData = null;
-                if(data != null) {
-                    byteData = task.getBytes();
-                }
+            byteData = task.getBytes();
 
-            zk.create(
+            try {
+                zk.create(
                 jobPath + "/",
                 byteData,
                 ZooDefs.Ids.OPEN_ACL_UNSAFE,
-                CreateMode.PERSISTENT)
+                CreateMode.PERSISTENT_SEQUENTIAL);
+            } catch(KeeperException e) {
+                System.out.println(e.code());
+            } catch(Exception e) {
+                System.out.println(e.getMessage());
+            }
+
         }
     }
 
     // Get the status of a job
-    public void handleStatus(String, requestPath, String pwHash) {
+    public void handleStatus(String requestPath, String pwHash) {
 
     	String nodeData;
-        Byte[] data;
-    	Stat stat;
+        byte[] data = null;
+    	Stat stat = null;
 
     	// We have the password hash -> traverse jobs.
-    	List<String> jobs = zk.getChildren(ZK_JOBS, false);
+        List<String> jobs = null;
+        try {
+            jobs = zk.getChildren(ZK_JOBS, false);
+        } catch(KeeperException e) {
+            System.out.println(e.code());
+        } catch(Exception e) {
+            System.out.println(e.getMessage());
+        }
 
     	// jobs has a list of paths.
     	Collections.sort(jobs);
-        System.out.println("jobs: " + requests.toString());
+        System.out.println("jobs: " + jobs.toString());
 
         // Traverse each job, and get the Stat.
         for (String path: jobs) {
-        	stat = new Stat();
-            data = zk.getData(ZK_JOBS + "/" + path, false, stat);
 
-            // Just to be sure!!
-            if (stat != null) {
-                nodeData = byteToString(data);
+            System.out.println("Getting job node @ path: " + ZK_JOBS + "/" + path);
+            try {
+                data = zk.getData(ZK_JOBS + "/" + path, false, stat);
+            } catch(KeeperException e) {
+                System.out.println(e.code());
+            } catch(Exception e) {
+                System.out.println(e.getMessage());
+            }
 
-                // Determine if this is the job we are looking for.
-                String[] resultArr = nodeData.split(":");
+            nodeData = zkc.byteToString(data);
 
-                if (resultArr[0].equals(pwHash)) {
-                	// We found the matching job! Get the status.
-                    String status = resultArr[1];
+            System.out.println("job nodeData: " + nodeData);
 
-                    // Setup the new data!
-                    String newData = String.format("%s:%s:%s", pwHash, status, "101");
+            // Determine if this is the job we are looking for.
+            String[] resultArr = nodeData.split(":");
 
-                    // Set the data in the node.
+            if (resultArr[0].equals(pwHash)) {
+                System.out.println("Found match...");
+            	// We found the matching job! Get the status.
+                String status = resultArr[1];
+
+                // Setup the new data!
+                String newData = String.format("%s:%s:%s", pwHash, status, "101");
+
+                // IMPORTANT: We need a buffer time to ensure the watch gets setup on the clientDriver before we return a status.
+                try {
+                    Thread.sleep(3000);
+                } catch (InterruptedException e) {
+                    System.out.println(e.getMessage());
+                }
+
+                // Set the data in the node.
+                try {
                     stat = zk.setData(
-                        requestPath,
-                        newData.getBytes(),
-                        -1
-                        );
+                    requestPath,
+                    newData.getBytes(),
+                    -1
+                    );
+                } catch(KeeperException e) {
+                    System.out.println(e.code());
+                } catch(Exception e) {
+                    System.out.println(e.getMessage());
+                }
+            }
+
+        }
+    }
+
+    public class RequestListener implements Runnable {
+        @Override
+        public void run() {
+            List<String> requests = null;
+            Stat stat = null;
+            byte[] data = null;
+            String nodeData;
+
+            while(true) {
+
+                try {
+                requests = zk.getChildren(ZK_REQUESTS, new Watcher() {
+                    @Override
+                    public void process(WatchedEvent event) {
+                        if (event.getType().equals(EventType.NodeChildrenChanged)) {
+                            // There has been a change in the number of jobs.
+                            childrenChangedLatch.countDown();
+                        }
+                    }
+                });
+                } catch(KeeperException e) {
+                    System.out.println(e.code());
+                } catch(Exception e) {
+                    System.out.println(e.getMessage());
+                }
+                // Sit and wait for a result!!
+                try{
+                    childrenChangedLatch.await();
+                    childrenChangedLatch = new CountDownLatch(1);
+                    requests = zk.getChildren(ZK_REQUESTS, false);
+                } catch(Exception e) {
+                    System.out.println(e.getMessage());
+                }
+
+                // Sort the jobs in order incase they are not.
+                // FROM API DOCS: The list of children returned is not sorted and no guarantee is provided as to its natural or lexical order.
+                Collections.sort(requests);
+                System.out.println("requests: " + requests.toString());
+
+                // Last request must be a new request.
+                String request = requests.get(requests.size()-1), result = null;
+
+                System.out.println("New Request: " + request);
+
+                stat = new Stat();
+                try {
+                    data = zk.getData(ZK_REQUESTS + "/" + request, false, stat);
+                } catch(KeeperException e) {
+                    System.out.println(e.code());
+                } catch(Exception e) {
+                    System.out.println(e.getMessage());
+                }
+
+                // Just to be sure!!
+                if (stat != null) {
+                    nodeData = zkc.byteToString(data);
+
+                    System.out.println("String data: " + nodeData);
+
+                    // Determine if this is a job or status.
+                    String[] resultArr = nodeData.split(":");
+
+                    if (resultArr[2].equals("100")) {
+                        // This is a job -- add to /jobs.
+                        handleJob(resultArr[0]);
+                    } else if (resultArr[2].equals("101")) {
+                        // This is a status -- get job status.
+                        handleStatus(ZK_REQUESTS + "/" + request, resultArr[0]);
+                    } else {
+                        System.out.println("Unknown Task Type!");
+                    }
                 }
 
             }
         }
     }
 
-    @Override
-    public void process(WatchedEvent event) {
-        // JobTracker watcher: watches if primary jt fails, makes self primary
-        boolean isNodeDeleted;
-        try {
-            isNodeDeleted = event.getType().equals(EventType.NodeDeleted);
-            String nodeName = event.getPath().split("/")[2];
+    public class JobTrackerListener implements Runnable {
+        @Override
+        public void run() {
+            // Get the list of jobtrackers.
+            List<String> jobTrackers = null;
+            String path;
 
-            if (mode.equals(TRACKER_BACKUP) // primary failure handling
-                    && isNodeDeleted
-                    && nodeName.equals(TRACKER_PRIMARY)) {
-                debug("detected primary failure, setting self as new primary");
-                zk.delete(myPath, 0);                           // remove self as backup
-                myPath = ZK_TRACKER + "/" + TRACKER_PRIMARY;    // add self as primary
-                mode = TRACKER_PRIMARY;
-                zk.create(myPath,
-                        null,
-                        ZooDefs.Ids.OPEN_ACL_UNSAFE,
-                        CreateMode.EPHEMERAL);
+            while(true) {
+                // Setup a watch on the node that is one smaller than this.
+                try {
+                    jobTrackers = zk.getChildren(ZK_TRACKERS, false);
+                } catch(KeeperException e) {
+                    System.out.println(e.code());
+                } catch(Exception e) {
+                    System.out.println(e.getMessage());
+                }
 
-                modeSignal.countDown();
+                // Order the jobtrackers...
+                Collections.sort(jobTrackers);
+
+                // We know we are the jobtracker @ jobTrackerPath
+                // Get index of...
+                path = jobTrackerPath.split("/")[2];
+
+                int myIndex = jobTrackers.indexOf(path);
+
+                System.out.println("Trackers: " + jobTrackers + " My path: " + path + " My index: " + myIndex);
+
+                if (myIndex != -1) {
+                    // We want to watch the previous node @ myIndex-1
+                    // We know that we are a backup so we are not first in the list. Thus myIndex-1 will always work.
+                    String watchingNode = ZK_TRACKERS + "/" + jobTrackers.get(myIndex-1);
+
+                    System.out.println("We will be watching: " + watchingNode);
+
+                    // Setup a watch on the smaller znode.
+                    try {
+                     zk.exists(watchingNode, new Watcher() {
+                        @Override
+                        public void process(WatchedEvent event) {
+                            if (event.getType().equals(EventType.NodeDeleted)) {
+                                jobTrackerLatch.countDown();
+                            }
+                        }
+                    });
+
+                    } catch(KeeperException e) {
+                        System.out.println(e.code());
+                    } catch(Exception e) {
+                        System.out.println(e.getMessage());
+                    }
+                    // Sit and wait for a result!!
+                    try{
+                        System.out.println("Watching Job Tracker: " + watchingNode);
+                        jobTrackerLatch.await();
+
+                         // Job Tracker Down!
+                        System.out.println("Job Tracker Down! Determine our position...");
+
+                        // Countdown occured.
+                        // Determine if we are the new leader
+                        try {
+                            jobTrackers = zk.getChildren(ZK_TRACKERS, false);
+                        } catch(KeeperException e) {
+                            System.out.println(e.code());
+                        } catch(Exception e) {
+                            System.out.println(e.getMessage());
+                        }
+
+                        // Order the jobtrackers...
+                        Collections.sort(jobTrackers);
+
+                        // If we are the first in the list -- we are the new leader! Set leader flag and start RequestListener Thread.
+
+                        if (jobTrackers.indexOf(path) == 0) {
+                            System.out.println("We are the new leader!");
+                            isLeader = true;
+                            break;
+                        } else {
+                            System.out.println("Still a backup...");
+                        }
+
+                        // Setup Latch again, we are still a backup!
+                        jobTrackerLatch = new CountDownLatch(1);
+
+                    } catch(Exception e) {
+                        System.out.println(e.getMessage());
+                    }
+
+                } else {
+                    System.exit(-1);
+
+                }
             }
-        } catch (KeeperException e) {
-            e.printStackTrace();
-        } catch (InterruptedException e) {
-            e.printStackTrace();
         }
     }
+
+        public class WorkerListener implements Runnable {
+        @Override
+        public void run() {
+            List<String> workersPrevious = null;
+            List<String> workers = null;
+            List<String> jobs = null;
+            List<String> tasks = null;
+            Stat stat = null;
+            byte[] data = null;
+            String nodeData;
+            String missingWorker = null;
+
+            while(true) {
+
+                try {
+                workersPrevious = zk.getChildren(ZK_WORKERS, new Watcher() {
+                    @Override
+                    public void process(WatchedEvent event) {
+                        if (event.getType().equals(EventType.NodeChildrenChanged)) {
+                            // There has been a change in the number of workers.
+                            workerLatch.countDown();
+                        }
+                    }
+                });
+                } catch(KeeperException e) {
+                    System.out.println(e.code());
+                } catch(Exception e) {
+                    System.out.println(e.getMessage());
+                }
+                // Sit and wait for a result!!
+                try{
+                    workerLatch.await();
+                    workerLatch = new CountDownLatch(1);
+
+                    workers = zk.getChildren(ZK_WORKERS, false);
+                } catch(Exception e) {
+                    System.out.println(e.getMessage());
+                }
+
+                // Sort the jobs in order incase they are not.
+                // FROM API DOCS: The list of children returned is not sorted and no guarantee is provided as to its natural or lexical order.
+                Collections.sort(workersPrevious);
+                Collections.sort(workers);
+
+                System.out.println("workersPrevious: " + workersPrevious.toString());
+                System.out.println("workers: " + workers.toString());
+
+                // If we had more workers before, we lost a worker!
+               if (workersPrevious.size() > workers.size()) {
+                    // Find out who we lost.
+                    for (int i=0; i<workersPrevious.size(); i++ ) {
+                        if (!workers.contains(workersPrevious.get(i))) {
+                            // This is the worker we lost.
+                            System.out.println("We lost worker: " + workersPrevious.get(i));
+
+                            missingWorker = workersPrevious.get(i);
+                            break;
+                        }
+                    }
+               }
+
+               if (missingWorker != null) {
+                     // Go through all ongoing jobs and determine which are ongoing.
+                    try {
+                        jobs = zk.getChildren(ZK_JOBS, false);
+                    } catch(KeeperException e) {
+                        System.out.println(e.code());
+                    } catch(Exception e) {
+                        System.out.println(e.getMessage());
+                    }
+
+                    // Sort the jobs.
+                    Collections.sort(jobs);
+
+                   // Traverse each job, and get the Stat.
+                    for (String path: jobs) {
+
+                        System.out.println("WorkerListener: Getting job node @ path: " + ZK_JOBS + "/" + path);
+                        try {
+                            data = zk.getData(
+                                ZK_JOBS + "/" + path,
+                                false,
+                                stat);
+                        } catch(KeeperException e) {
+                            System.out.println(e.code());
+                        } catch(Exception e) {
+                            System.out.println(e.getMessage());
+                        }
+
+                        nodeData = zkc.byteToString(data);
+
+                        System.out.println("WorkerListener: job nodeData: " + nodeData);
+
+                        // Determine if this is the job we are looking for.
+                        if (nodeData.split(":")[1].equals("ongoing")) {
+                            System.out.println("WorkerListener: This job is ongoing...check tasks.");
+
+                            // Remove tasks for the matching worker by getting tasks for job and replace any workerID matching missingWorker with -1
+
+                            try {
+                                tasks = zk.getChildren(ZK_JOBS + "/" + path, false, stat);
+                            } catch(KeeperException e) {
+                                System.out.println(e.code());
+                            } catch(Exception e) {
+                                System.out.println(e.getMessage());
+                            }
+
+                            System.out.println("tasks: " + tasks.toString());
+
+                            for (String task: tasks) {
+                                // Get the data of the task.
+                                try {
+                                    data = zk.getData(ZK_JOBS + "/" + path +  "/" +task, false, stat);
+                                } catch(KeeperException e) {
+                                    System.out.println(e.code());
+                                } catch(Exception e) {
+                                    System.out.println(e.getMessage());
+                                }
+
+                                nodeData = zkc.byteToString(data);
+
+                                System.out.println("WorkerListener: task nodeData: " + nodeData);
+
+                                if(nodeData.split(":")[0].equals(missingWorker)) {
+                                    System.out.println(" Worker " + missingWorker + " has died. Reset task to -1");
+
+                                     // Setup the new data!
+                                    String newData = String.format("%s:%s:%s", "-1", nodeData.split(":")[1], nodeData.split(":")[2]);
+
+
+                                    System.out.println("New Data for Task: " + newData);
+
+                                    // Set the data in the node.
+                                    try {
+                                        stat = zk.setData(
+                                        ZK_JOBS + "/" + path + "/" + task,
+                                        newData.getBytes(),
+                                        -1
+                                        );
+                                    } catch(KeeperException e) {
+                                        System.out.println(e.code());
+                                    } catch(Exception e) {
+                                        System.out.println(e.getMessage());
+                                    }
+                                }
+                            } // end of for loop for traversing tasks
+                        } // end of if statement if job is ongoing
+                    } // end of for loop for traversing jobs
+
+                    missingWorker = null;
+                } // if missingWorker is not null
+            } // while(true)
+        } // run
+    } // workerlistener
 
     public static void main(String[] args) {
 
@@ -356,16 +645,24 @@ public class JobTracker extends Thread implements Watcher {
 
         System.out.println("We have been set as: " + jobTrackerPath);
 
-        // If we are backup we sit and wait...
-        if (jobTrackerPath == (ZK_TRACKER + "/" + ZK_BACKUP)) {
+        // We are a backup, setup a listener.
+        if (!isLeader)
+            new Thread(jt.new JobTrackerListener()).start();
 
-            // Setup a watch on the primary job tracker.
-            zk.exists(ZK_TRACKER + "/" + ZK_PRIMARY, jt);
+        // Make sure we know when we are the leader...
+        while (!isLeader) {
+            try {
+                Thread.sleep(1000);
+            } catch (InterruptedException e) {
+                System.out.println(e);
+            }
 
-            // SIGNAL???
-            // trackerSignal.await();
         }
 
+        System.out.println("Starting the Worker Listener Thread");
+        new Thread(jt.new WorkerListener()).start();
+
+        System.out.println("Starting the Request Listener Thread");
         new Thread(jt.new RequestListener()).start();
     }
 }
