@@ -27,6 +27,8 @@ public class JobTracker extends Thread implements Watcher {
     static String ZK_FS = "/fs"
     static String ZK_WORKERS = "/workers";
 
+    static final int NUM_WORDS = 265744;
+
     // ZooKeeper resources
     ZkConnector zkc;
     ZooKeeper zk;
@@ -187,57 +189,135 @@ public class JobTracker extends Thread implements Watcher {
                 }
                 );
 
+                // COMPLETION OF REQUEST SHOULD OCCUR IN ANOTHER THREAD
                 // Sort the jobs in order incase they are not.
                 // FROM API DOCS: The list of children returned is not sorted and no guarantee is provided as to its natural or lexical order.
                 Collections.sort(requests);
                 System.out.println("requests: " + requests.toString());
 
                 // Last request must be a new request.
-                requests.get(requests.size-1);
+                String request = requests.get(requests.size-1), result = null;
+                stat = new Stat();
+                data = zk.getData(request_path + request, false, stat);
 
-                for (String path: requests) {
-                    stat = new Stat();
-                    data = zk.getData(ZK_JOBS + path, false, stat);
+                // Just to be sure!!
+                if (stat != null) {
+                    nodeData = byteToString(data);
 
-                    // Just to be sure!!
-                    if (stat != null) {
-                        nodeData = byteToString(data);
-                        //TO-DO: HANDLE THE JOB!!!!
-                        //handleTask(new TaskPacket(nodeData), path);
+                    // Determine if this is a job or status.
+                    String[] resultArr = nodeData.split(":");
+
+                    if (resultArr[2].equals("100")) {
+                    	// This is a job -- add to /jobs.
+                    	handleJob(resultArr[0]);
+                    } else if (resultArr[2].equals("101")) {
+                    	// This is a status -- get job status.
+                    	handleStatus(request_path + request, resultArr[0]);
+                    } else {
+                    	System.out.println("Unknown Task Type!");
                     }
                 }
+
             }
         }
     }
 
-    // Determine if the task is a job or status check.
-    public void handleTask(TaskPacket task, String path) {
-        if (task.packet_type == TaskPacket.TASK_JOB)
-            //handleJob();
-        if (task.packet_type == TaskPacket.TASK_STATUS)
-            //handleStatus();
-        else
-            System.out.println("Error. Unknown Packet Type: " + task.packet_type);
+    // Handle a new job
+    public void handleJob(String pwHash) {
+        String task = String.format("%s:%s",  pwHash, "ongoing");
+
+        // Set data string to bytes
+        byte[] byteData = null;
+            if(data != null) {
+                byteData = task.getBytes();
+            }
+
+        // Create a new job...
+        String jobPath = zk.create(
+            ZK_JOBS + "/",
+            byteData,
+            ZooDefs.Ids.OPEN_ACL_UNSAFE,
+            CreateMode.PERSISTENT_SEQUENTIAL);
+
+        // Determine the number of workers
+        Stat stat = zk.exists(ZK_WORKERS, false);
+        int numWorkers = stat.getNumChildren();
+
+        int partition_size = NUM_WORDS / numWorkers;
+        int word_remainder = NUM_WORDS % numWorkers;
+
+        // For each worker, create a task with start and end indices
+        for (int i = 0; i<numWorkers; i++) {
+            // Create a task under the job.
+            // owner: -1, start: i*part_size, end: (i + 1)* part_size
+
+            int startIdx = i * partition_size;
+            int endIdx;
+
+            if (i == (numWorkers-1) && (word_remainder != 0)) {
+            	 endIdx = word_remainder;
+            } else {
+            	endIdx = ((i + 1) * partition_size) -1;
+            }
+
+            String task = String.format("%s:%s:%s", "-1", Integer.toString(startIdx), Integer.toString(endIdx));
+
+            // Set data string to bytes
+            byte[] byteData = null;
+                if(data != null) {
+                    byteData = task.getBytes();
+                }
+
+            zk.create(
+                jobPath + "/",
+                byteData,
+                ZooDefs.Ids.OPEN_ACL_UNSAFE,
+                CreateMode.PERSISTENT)
+        }
     }
 
-    // Framework to handle a job is handled here...
+    // Get the status of a job
+    public void handleStatus(String, requestPath, String pwHash) {
 
-    // Framework to handle a status check is handled here...
+    	String nodeData;
+        Byte[] data;
+    	Stat stat;
 
-    // When a client adds a new job to /jobs/job#
-    // Add to our job hashmap.
-    private void addJobToMap(TaskPacket task) {
-        // Ensure we know of this client...
-        if (clientList.contains(task.client_id)) {
-            // Ensure the job has not been added before.
-            if ( jobs.get(task.client_id) == null) {
-                // New job, valid client. Add up!!
-                jobs.put(task.client_id, new ArrayList<String>()); //no ArrayList assigned, create new ArrayList
+    	// We have the password hash -> traverse jobs.
+    	List<String> jobs = zk.getChildren(ZK_JOBS, false);
+
+    	// jobs has a list of paths.
+    	Collections.sort(jobs);
+        System.out.println("jobs: " + requests.toString());
+
+        // Traverse each job, and get the Stat.
+        for (String path: jobs) {
+        	stat = new Stat();
+            data = zk.getData(ZK_JOBS + "/" + path, false, stat);
+
+            // Just to be sure!!
+            if (stat != null) {
+                nodeData = byteToString(data);
+
+                // Determine if this is the job we are looking for.
+                String[] resultArr = nodeData.split(":");
+
+                if (resultArr[0].equals(pwHash)) {
+                	// We found the matching job! Get the status.
+                    String status = resultArr[1];
+
+                    // Setup the new data!
+                    String newData = String.format("%s:%s:%s", pwHash, status, "101");
+
+                    // Set the data in the node.
+                    stat = zk.setData(
+                        requestPath,
+                        newData.getBytes(),
+                        -1
+                        );
+                }
+
             }
-            // Fill in the password hash
-            jobs.get(task.client_id).add(task.pwHash);
-        } else {
-            System.out.println("cant find client " + task.client_id + " in list");
         }
     }
 
