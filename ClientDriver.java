@@ -5,6 +5,7 @@ import org.apache.zookeeper.KeeperException.Code;
 import org.apache.zookeeper.Watcher.Event.EventType;
 import org.apache.zookeeper.ZooDefs.Ids;
 import java.util.concurrent.CountDownLatch;
+import java.util.List;
 import java.io.Console;
 import java.io.IOException;
 
@@ -20,8 +21,11 @@ The purpose of the Client Driver is as follows:
 public class ClientDriver {
 
     static String ZK_REQUESTS = "/requests";
+    static String ZK_TRACKERS = "/jt";
     static String request_path;
 
+    CountDownLatch jtCreatedLatch = new CountDownLatch(1);
+    CountDownLatch jtRootCreatedLatch = new CountDownLatch(1);
     CountDownLatch nodeCreatedLatch = new CountDownLatch(1);
     ZkConnector zkc;
     ZooKeeper zk;
@@ -43,17 +47,69 @@ public class ClientDriver {
 
     public void sendTask(TaskPacket task) {
         String data = task.toString();
+        Stat stat = null;
+        List<String> jobTrackers = null;
 
-        Code ret = createRequestPath(data);
+        // First ensure that a job tracker exists...
+        try {
+            Thread.sleep(3000);
 
-        if (ret != Code.OK) {
-            System.out.println("Something is wrong... RET: " + ret);
-            return;
+            stat = zk.exists(ZK_TRACKERS, new Watcher() {
+                @Override
+                public void process(WatchedEvent event) {
+                    if (event.getType() == Event.EventType.NodeCreated) {
+                        jtRootCreatedLatch.countDown();
+                    }
+                }
+            });
+
+            if (stat == null) {
+                System.out.println("Going to sleep waiting for root /jt");
+                jtRootCreatedLatch.await();
+                System.out.println("root /jt exists");
+            }
+
+
+        } catch (Exception e) {
+            System.out.println("Job Tracker Exists Error");
         }
 
-        else if(ret == Code.OK) {
-            System.out.println("Successfully created the job: " + request_path);
+        try {
+            jobTrackers = zk.getChildren(ZK_TRACKERS, false);
+
+            System.out.println("Size of jobtrackers: " + jobTrackers.size());
+            if (jobTrackers.size() == 0) {
+                jobTrackers = zk.getChildren(ZK_TRACKERS, new Watcher() {
+                    @Override
+                    public void process(WatchedEvent event) {
+                        if (event.getType() == Event.EventType.NodeChildrenChanged) {
+                            jtCreatedLatch.countDown();
+                        }
+                    }
+                });
+                // Go to sleep waiting for a job tracker
+                System.out.println("Going to sleep waiting for job tracker.");
+                jtCreatedLatch.await();
+                System.out.println("We awake. There is a job tracker");
+
+            }
+
+            Thread.sleep(3000);
+            Code ret = createRequestPath(data);
+
+            if (ret != Code.OK) {
+                System.out.println("Something is wrong... RET: " + ret);
+                return;
+            }
+
+            else if(ret == Code.OK) {
+                System.out.println("Successfully created the job: " + request_path);
+            }
+
+        } catch (Exception e) {
+            System.out.println("Error getting children of JT node");
         }
+
     }
 
     // Create this override so that we can get the PATH for the job and keep track of it for later determining the result and deleting the node!
@@ -100,14 +156,20 @@ public class ClientDriver {
 
             if(status.equals("ongoing")) {
                 System.out.println("Job in progress");
-            } else {
+            }
+
+            else if (status.equals("noMatch")) {
+                System.out.println("No such job existed.");
+            }
+
+            else {
                 if(status.equals("failed")){
-                    outString = "password not found";
+                    outString = "Failed: Password not found";
                 } else {
-                    outString = status;
+                    outString = "Password found: " + status;
                 }
 
-                System.out.println("Job is finished " + outString); //Give the result to the user.
+                System.out.println(outString); //Give the result to the user.
             }
 
 

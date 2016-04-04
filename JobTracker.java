@@ -201,8 +201,16 @@ public class JobTracker extends Thread {
 
         System.out.println("Number of workers: " + numWorkers);
 
-        int partition_size = NUM_WORDS / numWorkers;
-        int word_remainder = NUM_WORDS % numWorkers;
+        int partition_size;
+        int word_remainder;
+
+        if (numWorkers == 0) {
+            partition_size = NUM_WORDS / 1;
+            word_remainder = NUM_WORDS % 1;
+        } else {
+            partition_size = NUM_WORDS / numWorkers;
+            word_remainder = NUM_WORDS % numWorkers;
+        }
 
         // For each worker, create a task with start and end indices
         for (int i = 0; i<numWorkers; i++) {
@@ -288,7 +296,7 @@ public class JobTracker extends Thread {
 
                 // IMPORTANT: We need a buffer time to ensure the watch gets setup on the clientDriver before we return a status.
                 try {
-                    Thread.sleep(3000);
+                    Thread.sleep(1000);
                 } catch (InterruptedException e) {
                     System.out.println(e.getMessage());
                 }
@@ -300,20 +308,40 @@ public class JobTracker extends Thread {
                     newData.getBytes(),
                     -1
                     );
+
+                    return;
                 } catch(KeeperException e) {
                     System.out.println(e.code());
                 } catch(Exception e) {
                     System.out.println(e.getMessage());
                 }
             }
-
         }
+
+        String newData = String.format("%s:%s:%s", pwHash, "noMatch", "101");
+        // No match in /jobs
+        // Set the data in the node.
+                try {
+                    stat = zk.setData(
+                    requestPath,
+                    newData.getBytes(),
+                    -1
+                    );
+
+                    return;
+                } catch(KeeperException e) {
+                    System.out.println(e.code());
+                } catch(Exception e) {
+                    System.out.println(e.getMessage());
+                }
+
     }
 
     public class RequestListener implements Runnable {
         @Override
         public void run() {
             List<String> requests = null;
+            List<String> requestsPrevious = null;
             Stat stat = null;
             byte[] data = null;
             String nodeData;
@@ -321,7 +349,7 @@ public class JobTracker extends Thread {
             while(true) {
 
                 try {
-                requests = zk.getChildren(ZK_REQUESTS, new Watcher() {
+                requestsPrevious = zk.getChildren(ZK_REQUESTS, new Watcher() {
                     @Override
                     public void process(WatchedEvent event) {
                         if (event.getType().equals(EventType.NodeChildrenChanged)) {
@@ -343,6 +371,10 @@ public class JobTracker extends Thread {
                 } catch(Exception e) {
                     System.out.println(e.getMessage());
                 }
+
+                // Do not react to requests being removed.
+                if(requests.size() <= requestsPrevious.size())
+                    continue;
 
                 // Sort the jobs in order incase they are not.
                 // FROM API DOCS: The list of children returned is not sorted and no guarantee is provided as to its natural or lexical order.
@@ -643,7 +675,7 @@ public class JobTracker extends Thread {
 
         JobTracker jt = new JobTracker(args[0]);
 
-        System.out.println("We have been set as: " + jobTrackerPath);
+        System.out.println("We have been set as: " + jobTrackerPath + " and isLeader is: " + isLeader);
 
         // We are a backup, setup a listener.
         if (!isLeader)
@@ -652,7 +684,7 @@ public class JobTracker extends Thread {
         // Make sure we know when we are the leader...
         while (!isLeader) {
             try {
-                Thread.sleep(1000);
+                Thread.sleep(700);
             } catch (InterruptedException e) {
                 System.out.println(e);
             }
