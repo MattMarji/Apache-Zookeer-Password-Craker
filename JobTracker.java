@@ -165,7 +165,7 @@ public class JobTracker extends Thread {
     }
 
     // Handle a new job
-    public void handleJob(String pwHash) {
+    public void handleJob(String requestPath, String pwHash) {
         String task = String.format("%s:%s",  pwHash, "ongoing");
 
         // Set data string to bytes
@@ -237,12 +237,38 @@ public class JobTracker extends Thread {
                 byteData,
                 ZooDefs.Ids.OPEN_ACL_UNSAFE,
                 CreateMode.PERSISTENT_SEQUENTIAL);
+
+                task = String.format("%s:%s:%s", pwHash, "ongoing", "200");
+                byteData = task.getBytes();
+
+                zk.setData(
+                requestPath,
+                byteData,
+                -1);
+
+                System.out.println("Writing 200 as status of: " + requestPath);
             } catch(KeeperException e) {
                 System.out.println(e.code());
             } catch(Exception e) {
                 System.out.println(e.getMessage());
             }
 
+        } // end of for loop
+
+        try {
+            task = String.format("%s:%s:%s", pwHash, "ongoing", "200");
+            byteData = task.getBytes();
+
+            zk.setData(
+            requestPath,
+            byteData,
+            -1);
+
+            System.out.println("Writing 200 as status of: " + requestPath);
+        } catch(KeeperException e) {
+            System.out.println(e.code());
+        } catch(Exception e) {
+            System.out.println(e.getMessage());
         }
     }
 
@@ -292,7 +318,7 @@ public class JobTracker extends Thread {
                 String status = resultArr[1];
 
                 // Setup the new data!
-                String newData = String.format("%s:%s:%s", pwHash, status, "101");
+                String newData = String.format("%s:%s:%s", pwHash, status, "200");
 
                 // IMPORTANT: We need a buffer time to ensure the watch gets setup on the clientDriver before we return a status.
                 try {
@@ -318,7 +344,7 @@ public class JobTracker extends Thread {
             }
         }
 
-        String newData = String.format("%s:%s:%s", pwHash, "noMatch", "101");
+        String newData = String.format("%s:%s:%s", pwHash, "noMatch", "200");
         // No match in /jobs
         // Set the data in the node.
                 try {
@@ -341,80 +367,62 @@ public class JobTracker extends Thread {
         @Override
         public void run() {
             List<String> requests = null;
-            List<String> requestsPrevious = null;
+            List<String> requestsPrevious = new ArrayList<String>();
             Stat stat = null;
             byte[] data = null;
             String nodeData;
+            String request;
+            int newRequests = 0;
+            String[] resultArr = null;
 
             while(true) {
 
                 try {
-                requestsPrevious = zk.getChildren(ZK_REQUESTS, new Watcher() {
-                    @Override
-                    public void process(WatchedEvent event) {
-                        if (event.getType().equals(EventType.NodeChildrenChanged)) {
-                            // There has been a change in the number of jobs.
-                            childrenChangedLatch.countDown();
+                requests = zk.getChildren(ZK_REQUESTS, false);
+                Collections.sort(requests);
+
+                newRequests = requests.size() - requestsPrevious.size();
+
+                    if (newRequests <= 0) {
+                        continue;
+                    } else {
+                        System.out.println("There are " + newRequests + " new requests");
+                        // There are new requests. Process them all.
+                        for(int i=(requests.size() - newRequests); i<requests.size(); i++) {
+                            request = requests.get(i);
+                            System.out.println("i: " + i);
+                            data = zk.getData(
+                                ZK_REQUESTS + "/" + request,
+                                false,
+                                stat);
+
+                            nodeData = new String(data, "UTF-8");
+
+                            resultArr = nodeData.split(":");
+
+                            System.out.println("Request is: " + request);
+
+                             if (resultArr[2].equals("100")) {
+                                System.out.println("Handling job: " + ZK_REQUESTS + "/" + request);
+                            // This is a job -- add to /jobs.
+                            handleJob(ZK_REQUESTS + "/" + request, resultArr[0]);
+                            } else if (resultArr[2].equals("101")) {
+                                System.out.println("Handling job status request: " + ZK_REQUESTS + "/" + request);
+                                // This is a status -- get job status.
+                                handleStatus(ZK_REQUESTS + "/" + request, resultArr[0]);
+                            } else if (resultArr[2].equals("200")) {
+                                System.out.println("Skipping request: " + ZK_REQUESTS + "/" + request + " because it is complete");
+                                continue;
+                            }
+                            else {
+                                System.out.println("Unknown Task Type!");
+                            }
                         }
                     }
-                });
-                } catch(KeeperException e) {
-                    System.out.println(e.code());
-                } catch(Exception e) {
-                    System.out.println(e.getMessage());
+                } catch (Exception e) {
+                    System.out.println("Exception trying to get /requests children");
                 }
-                // Sit and wait for a result!!
-                try{
-                    childrenChangedLatch.await();
-                    childrenChangedLatch = new CountDownLatch(1);
-                    requests = zk.getChildren(ZK_REQUESTS, false);
-                } catch(Exception e) {
-                    System.out.println(e.getMessage());
-                }
-
-                // Do not react to requests being removed.
-                if(requests.size() <= requestsPrevious.size())
-                    continue;
-
-                // Sort the jobs in order incase they are not.
-                // FROM API DOCS: The list of children returned is not sorted and no guarantee is provided as to its natural or lexical order.
-                Collections.sort(requests);
-                System.out.println("requests: " + requests.toString());
-
-                // Last request must be a new request.
-                String request = requests.get(requests.size()-1), result = null;
-
-                System.out.println("New Request: " + request);
-
-                stat = new Stat();
-                try {
-                    data = zk.getData(ZK_REQUESTS + "/" + request, false, stat);
-                } catch(KeeperException e) {
-                    System.out.println(e.code());
-                } catch(Exception e) {
-                    System.out.println(e.getMessage());
-                }
-
-                // Just to be sure!!
-                if (stat != null) {
-                    nodeData = zkc.byteToString(data);
-
-                    System.out.println("String data: " + nodeData);
-
-                    // Determine if this is a job or status.
-                    String[] resultArr = nodeData.split(":");
-
-                    if (resultArr[2].equals("100")) {
-                        // This is a job -- add to /jobs.
-                        handleJob(resultArr[0]);
-                    } else if (resultArr[2].equals("101")) {
-                        // This is a status -- get job status.
-                        handleStatus(ZK_REQUESTS + "/" + request, resultArr[0]);
-                    } else {
-                        System.out.println("Unknown Task Type!");
-                    }
-                }
-
+            requestsPrevious = requests;
             }
         }
     }

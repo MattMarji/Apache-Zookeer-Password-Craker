@@ -654,6 +654,10 @@ public class Worker {
 
 							//Go to sleep waiting for the latch to trigger, only wake up if a FS was added.
 					        try{
+
+					        	System.out.println("The primary FS died, there were no backups available. Going to watch the /fs node and sleep.");
+					        	worker.fsIP = null;
+					        	worker.fsPort = -1;
 					            backupExistsLatch.await();
 					            backupExistsLatch = new CountDownLatch(1);
 
