@@ -68,6 +68,8 @@ public class JobTracker extends Thread {
 
     public void createZNodes() {
         Stat stat;
+        String myPath = null, firstJTPath = null;
+        List<String> jobTrackers = new ArrayList<String>();
         try {
             String trackerPath;
 
@@ -93,7 +95,16 @@ public class JobTracker extends Thread {
                     CreateMode.EPHEMERAL_SEQUENTIAL
                     );
 
-                isLeader = true;
+                myPath = jobTrackerPath.split("/")[2];
+                jobTrackers = zk.getChildren(ZK_TRACKERS, false);
+
+                Collections.sort(jobTrackers);
+
+                firstJTPath = jobTrackers.get(0);
+
+                if(firstJTPath.equals(myPath)){
+                    isLeader = true;
+                }
             }
 
             // /tracker exists --> if it has a child already assume it has a leader, else take over as leader!
@@ -108,7 +119,17 @@ public class JobTracker extends Thread {
                     CreateMode.EPHEMERAL_SEQUENTIAL
                     );
 
-                   isLeader = true;
+                   myPath = jobTrackerPath.split("/")[2];
+
+                    jobTrackers = zk.getChildren(ZK_TRACKERS, false);
+
+                    Collections.sort(jobTrackers);
+
+                    firstJTPath = jobTrackers.get(0);
+
+                    if(firstJTPath.equals(myPath)){
+                        isLeader = true;
+                    }
 
                } else {
                    jobTrackerPath = zk.create(
